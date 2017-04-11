@@ -1,262 +1,130 @@
-#!/usr/bin/env python2
-# Copyright (c) 2015-2017, NVIDIA CORPORATION.  All rights reserved.
-
+#!/usr/bin/env python
 """
-Classify an image using individual model files
-
-Use this script as an example to build your own tool
+Copyright 2016 Yahoo Inc.
+Licensed under the terms of the 2 clause BSD license. 
+Please see LICENSE file in the project root for terms.
 """
 
-import argparse
-import os
-import time
-
-from google.protobuf import text_format
 import numpy as np
-import PIL.Image
-import scipy.misc
+import os
+import sys
+import argparse
+import glob
+import time
+from PIL import Image
+from StringIO import StringIO
+import caffe
 
-os.environ['GLOG_minloglevel'] = '2'  # Suppress most caffe output
-import caffe  # noqa
-from caffe.proto import caffe_pb2  # noqa
 
-
-def get_net(caffemodel, deploy_file, use_gpu=True):
+def resize_image(data, sz=(256, 256)):
     """
-    Returns an instance of caffe.Net
-
-    Arguments:
-    caffemodel -- path to a .caffemodel file
-    deploy_file -- path to a .prototxt file
-
-    Keyword arguments:
-    use_gpu -- if True, use the GPU for inference
+    Resize image. Please use this resize logic for best results instead of the 
+    caffe, since it was used to generate training dataset 
+    :param str data:
+        The image data
+    :param sz tuple:
+        The resized image dimensions
+    :returns bytearray:
+        A byte array with the resized image
     """
-    if use_gpu:
-        caffe.set_mode_gpu()
+    img_data = str(data)
+    im = Image.open(StringIO(img_data))
+    if im.mode != "RGB":
+        im = im.convert('RGB')
+    imr = im.resize(sz, resample=Image.BILINEAR)
+    fh_im = StringIO()
+    imr.save(fh_im, format='JPEG')
+    fh_im.seek(0)
+    return bytearray(fh_im.read())
 
-    # load a new model
-    return caffe.Net(deploy_file, caffemodel, caffe.TEST)
-
-
-def get_transformer(deploy_file, mean_file=None):
+def caffe_preprocess_and_compute(pimg, caffe_transformer=None, caffe_net=None,
+    output_layers=None):
     """
-    Returns an instance of caffe.io.Transformer
-
-    Arguments:
-    deploy_file -- path to a .prototxt file
-
-    Keyword arguments:
-    mean_file -- path to a .binaryproto file (optional)
+    Run a Caffe network on an input image after preprocessing it to prepare
+    it for Caffe.
+    :param PIL.Image pimg:
+        PIL image to be input into Caffe.
+    :param caffe.Net caffe_net:
+        A Caffe network with which to process pimg afrer preprocessing.
+    :param list output_layers:
+        A list of the names of the layers from caffe_net whose outputs are to
+        to be returned.  If this is None, the default outputs for the network
+        are returned.
+    :return:
+        Returns the requested outputs from the Caffe net.
     """
-    network = caffe_pb2.NetParameter()
-    with open(deploy_file) as infile:
-        text_format.Merge(infile.read(), network)
+    if caffe_net is not None:
 
-    if network.input_shape:
-        dims = network.input_shape[0].dim
+        # Grab the default output names if none were requested specifically.
+        if output_layers is None:
+            output_layers = caffe_net.outputs
+
+        img_data_rs = resize_image(pimg, sz=(256, 256))
+        image = caffe.io.load_image(StringIO(img_data_rs))
+
+        H, W, _ = image.shape
+        _, _, h, w = caffe_net.blobs['data'].data.shape
+        h_off = max((H - h) / 2, 0)
+        w_off = max((W - w) / 2, 0)
+        crop = image[h_off:h_off + h, w_off:w_off + w, :]
+        transformed_image = caffe_transformer.preprocess('data', crop)
+        transformed_image.shape = (1,) + transformed_image.shape
+
+        input_name = caffe_net.inputs[0]
+        all_outputs = caffe_net.forward_all(blobs=output_layers,
+                    **{input_name: transformed_image})
+
+        outputs = all_outputs[output_layers[0]][0].astype(float)
+        return outputs
     else:
-        dims = network.input_dim[:4]
-
-    t = caffe.io.Transformer(inputs={'data': dims})
-    t.set_transpose('data', (2, 0, 1))  # transpose to (channels, height, width)
-
-    # color images
-    if dims[1] == 3:
-        # channel swap
-        t.set_channel_swap('data', (2, 1, 0))
-
-    if mean_file:
-        # set mean pixel
-        with open(mean_file, 'rb') as infile:
-            blob = caffe_pb2.BlobProto()
-            blob.MergeFromString(infile.read())
-            if blob.HasField('shape'):
-                blob_dims = blob.shape
-                assert len(blob_dims) == 4, 'Shape should have 4 dimensions - shape is "%s"' % blob.shape
-            elif blob.HasField('num') and blob.HasField('channels') and \
-                    blob.HasField('height') and blob.HasField('width'):
-                blob_dims = (blob.num, blob.channels, blob.height, blob.width)
-            else:
-                raise ValueError('blob does not provide shape or 4d dimensions')
-            pixel = np.reshape(blob.data, blob_dims[1:]).mean(1).mean(1)
-            t.set_mean('data', pixel)
-
-    return t
+        return []
 
 
-def load_image(path, height, width, mode='RGB'):
-    """
-    Load an image from disk
-
-    Returns an np.ndarray (channels x width x height)
-
-    Arguments:
-    path -- path to an image on disk
-    width -- resize dimension
-    height -- resize dimension
-
-    Keyword arguments:
-    mode -- the PIL mode that the image should be converted to
-        (RGB for color or L for grayscale)
-    """
-    image = PIL.Image.open(path)
-    image = image.convert(mode)
-    image = np.array(image)
-    # squash
-    image = scipy.misc.imresize(image, (height, width), 'bilinear')
-    return image
-
-
-def forward_pass(images, net, transformer, batch_size=None):
-    """
-    Returns scores for each image as an np.ndarray (nImages x nClasses)
-
-    Arguments:
-    images -- a list of np.ndarrays
-    net -- a caffe.Net
-    transformer -- a caffe.io.Transformer
-
-    Keyword arguments:
-    batch_size -- how many images can be processed at once
-        (a high value may result in out-of-memory errors)
-    """
-    if batch_size is None:
-        batch_size = 1
-
-    caffe_images = []
-    for image in images:
-        if image.ndim == 2:
-            caffe_images.append(image[:, :, np.newaxis])
-        else:
-            caffe_images.append(image)
-
-    dims = transformer.inputs['data'][1:]
-
-    scores = None
-    for chunk in [caffe_images[x:x + batch_size] for x in xrange(0, len(caffe_images), batch_size)]:
-        new_shape = (len(chunk),) + tuple(dims)
-        if net.blobs['data'].data.shape != new_shape:
-            net.blobs['data'].reshape(*new_shape)
-        for index, image in enumerate(chunk):
-            image_data = transformer.preprocess('data', image)
-            net.blobs['data'].data[index] = image_data
-        start = time.time()
-        output = net.forward()[net.outputs[-1]]
-        end = time.time()
-        if scores is None:
-            scores = np.copy(output)
-        else:
-            scores = np.vstack((scores, output))
-        print 'Processed %s/%s images in %f seconds ...' % (len(scores), len(caffe_images), (end - start))
-
-    return scores
-
-
-def read_labels(labels_file):
-    """
-    Returns a list of strings
-
-    Arguments:
-    labels_file -- path to a .txt file
-    """
-    if not labels_file:
-        print 'WARNING: No labels file provided. Results will be difficult to interpret.'
-        return None
-
-    labels = []
-    with open(labels_file) as infile:
-        for line in infile:
-            label = line.strip()
-            if label:
-                labels.append(label)
-    assert len(labels), 'No labels found'
-    return labels
-
-
-def classify(caffemodel, deploy_file, image_files,
-             mean_file=None, labels_file=None, batch_size=None, use_gpu=True):
-    """
-    Classify some images against a Caffe model and print the results
-
-    Arguments:
-    caffemodel -- path to a .caffemodel
-    deploy_file -- path to a .prototxt
-    image_files -- list of paths to images
-
-    Keyword arguments:
-    mean_file -- path to a .binaryproto
-    labels_file path to a .txt file
-    use_gpu -- if True, run inference on the GPU
-    """
-    # Load the model and images
-    net = get_net(caffemodel, deploy_file, use_gpu)
-    transformer = get_transformer(deploy_file, mean_file)
-    _, channels, height, width = transformer.inputs['data']
-    if channels == 3:
-        mode = 'RGB'
-    elif channels == 1:
-        mode = 'L'
-    else:
-        raise ValueError('Invalid number for channels: %s' % channels)
-    images = [load_image(image_file, height, width, mode) for image_file in image_files]
-    labels = read_labels(labels_file)
-
-    # Classify the image
-    scores = forward_pass(images, net, transformer, batch_size=batch_size)
-
-    #
-    # Process the results
-    #
-
-    indices = (-scores).argsort()[:, :5]  # take top 5 results
-    classifications = []
-    for image_index, index_list in enumerate(indices):
-        result = []
-        for i in index_list:
-            # 'i' is a category in labels and also an index into scores
-            if labels is None:
-                label = 'Class #%s' % i
-            else:
-                label = labels[i]
-            result.append((label, round(100.0 * scores[image_index, i], 4)))
-        classifications.append(result)
-
-    '''for index, classification in enumerate(classifications):
-        print '{:-^80}'.format(' Prediction for %s ' % image_files[index])
-        for label, confidence in classification:
-            print '{:9.4%} - "{}"'.format(confidence / 100.0, label)
-        print
-    '''
-    return classifications
 
 
 if __name__ == '__main__':
+    #main(sys.argv)
+
     script_start_time = time.time()
 
-    parser = argparse.ArgumentParser(description='Classification example - DIGITS')
+    pycaffe_dir = os.path.dirname(__file__)
+    
+    parser = argparse.ArgumentParser(description='Classification nsfw')
 
-    # Positional arguments
-    parser.add_argument('caffemodel', help='Path to a .caffemodel')
-    parser.add_argument('deploy_file', help='Path to the deploy file')
-    parser.add_argument('image_file', nargs='+', help='Path[s] to an image')
+    ### Positional arguments
 
-    # Optional arguments
-    parser.add_argument('-m', '--mean', help='Path to a mean file (*.npy)')
-    parser.add_argument('-l', '--labels', help='Path to a labels file')
-    parser.add_argument('--batch-size', type=int)
-    parser.add_argument('--nogpu', action='store_true', help="Don't use the GPU")
-
-    args = vars(parser.parse_args())
-
-    classify(
-        args['caffemodel'],
-        args['deploy_file'],
-        args['image_file'],
-        args['mean'],
-        args['labels'],
-        args['batch_size'],
-        not args['nogpu'],
+    parser.add_argument(
+        "input_file",
+        help="Path to the input image file"
     )
 
-    print 'Script took %f seconds.' % (time.time() - script_start_time,)
+    parser.add_argument(
+        "--model_def",
+        help="Model definition file. caffemodel"
+    )
+    parser.add_argument(
+        "--pretrained_model",
+        help="Trained model weights file. prototxt"
+    )
+
+    args = parser.parse_args()
+    image_data = open(args.input_file).read()
+
+    # Pre-load caffe model.
+    nsfw_net = caffe.Net(args.model_def,  # pylint: disable=invalid-name
+        args.pretrained_model, caffe.TEST)
+
+    # Load transformer
+    # Note that the parameters are hard-coded for best results
+    caffe_transformer = caffe.io.Transformer({'data': nsfw_net.blobs['data'].data.shape})
+    caffe_transformer.set_transpose('data', (2, 0, 1))  # move image channels to outermost
+    caffe_transformer.set_mean('data', np.array([104, 117, 123]))  # subtract the dataset-mean value in each channel
+    caffe_transformer.set_raw_scale('data', 255)  # rescale from [0, 1] to [0, 255]
+    caffe_transformer.set_channel_swap('data', (2, 1, 0))  # swap channels from RGB to BGR
+
+    # Classify.
+    scores = caffe_preprocess_and_compute(image_data, caffe_transformer=caffe_transformer, caffe_net=nsfw_net, output_layers=['prob'])
+
+    # Scores is the array containing SFW / NSFW image probabilities
+    # scores[1] indicates the NSFW probability
+    print "NSFW score:  " , scores[1]
